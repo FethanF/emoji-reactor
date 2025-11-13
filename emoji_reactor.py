@@ -2,25 +2,30 @@
 """
 Real-time emoji display based on camera pose and facial expression detection.
 """
-
+import traceback
 import cv2
+import numpy as np
 import mediapipe as mp
 # NEW IMPORTS FOR GESTURE RECOGNIZER
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
-import numpy as np 
+from mediapipe.python.solutions import drawing_utils
+
 
 # Initialize MediaPipe
 mp_pose = mp.solutions.pose
 mp_face_mesh = mp.solutions.face_mesh
 mp_drawing = mp.solutions.drawing_utils
+mp_hands = mp.solutions.hands
+mp_drawing_styles = mp.solutions.drawing_styles
 
 # Configuration
-SMILE_THRESHOLD = 0.07
-SAD_THRESHOLD = 0.035
+SMILE_THRESHOLD = 0.0155
+SAD_THRESHOLD = -0.001
 WINDOW_WIDTH = 720
 WINDOW_HEIGHT = 450
 EMOJI_WINDOW_SIZE = (WINDOW_WIDTH, WINDOW_HEIGHT)
+textToggle = 1
 
 # --- NEW: GESTURE RECOGNIZER SETUP ---
 MODEL_PATH = 'gesture_recognizer.task'
@@ -66,6 +71,7 @@ try:
     straight_face_emoji = cv2.resize(straight_face_emoji, EMOJI_WINDOW_SIZE)
     hands_up_emoji = cv2.resize(hands_up_emoji, EMOJI_WINDOW_SIZE)
     thumbs_up_emoji = cv2.resize(thumbs_up_emoji, EMOJI_WINDOW_SIZE)
+    sad_emoji = cv2.resize(sad_emoji, EMOJI_WINDOW_SIZE)
     
 except Exception as e:
     print("Error loading emoji images!")
@@ -101,7 +107,8 @@ print("  Straight face for neutral emoji")
 
 # mp_pose is kept running ONLY for the 'Hands Up' body pose check
 with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose, \
-     mp_face_mesh.FaceMesh(max_num_faces=1, min_detection_confidence=0.5) as face_mesh:
+     mp_face_mesh.FaceMesh(max_num_faces=1, min_detection_confidence=0.5) as face_mesh, \
+     mp_hands.Hands(model_complexity=0, min_detection_confidence=0.5, min_tracking_confidence=0.5) as hands:
 
     while cap.isOpened():
         success, frame = cap.read()
@@ -110,15 +117,37 @@ with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as 
 
         frame = cv2.flip(frame, 1)
         image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        
         image_rgb.flags.writeable = False
+
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_rgb)
 
         current_state = "STRAIGHT_FACE"
         mouth_aspect_ratio = 0.0 # Initialize for printing
 
+        body_pose = pose.process(image_rgb)
+
+        # --- 0. DRAW HAND LANDMARKS ---
+        try:
+            results = hands.process(image_rgb)
+            image_rgb.flags.writeable = True
+
+            if results.multi_hand_landmarks:
+                for hand_landmarks in results.multi_hand_landmarks:
+                    mp_drawing.draw_landmarks(
+                        frame,
+                        hand_landmarks,
+                        mp_hands.HAND_CONNECTIONS,
+                        mp_drawing_styles.get_default_hand_landmarks_style(),
+                        mp_drawing_styles.get_default_hand_connections_style())
+
+            
+        except Exception as e:
+            print("Error: Failed to draw pose:", e)
+            traceback.print_exc()
+
+
         # --- 1. CHECK FOR THUMBS UP (USING NEW MODEL) ---
         # Convert the frame to a MediaPipe Image object
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_rgb)
         recognition_result = recognizer.recognize(mp_image)
 
         if recognition_result.gestures:
@@ -136,19 +165,17 @@ with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as 
 
         # --- 2. CHECK FOR HANDS UP (USING BODY POSE) ---
         # Only check this if THUMBS_UP wasn't detected
-        if current_state != "THUMBS_UP":
-            results_pose = pose.process(image_rgb)
-            if results_pose.pose_landmarks:
-                landmarks = results_pose.pose_landmarks.landmark
+        if current_state != "THUMBS_UP" and body_pose.pose_landmarks:
+            landmarks = body_pose.pose_landmarks.landmark
 
-                # This logic checks if wrists are above shoulders
-                left_shoulder = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER]
-                right_shoulder = landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER]
-                left_wrist = landmarks[mp_pose.PoseLandmark.LEFT_WRIST]
-                right_wrist = landmarks[mp_pose.PoseLandmark.RIGHT_WRIST]
+            # This logic checks if wrists are above shoulders
+            left_shoulder = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER]
+            right_shoulder = landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER]
+            left_wrist = landmarks[mp_pose.PoseLandmark.LEFT_WRIST]
+            right_wrist = landmarks[mp_pose.PoseLandmark.RIGHT_WRIST]
 
-                if (left_wrist.y < left_shoulder.y) or (right_wrist.y < right_shoulder.y):
-                    current_state = "HANDS_UP"
+            if (left_wrist.y < left_shoulder.y) and (right_wrist.y < right_shoulder.y):
+                current_state = "HANDS_UP"
         
         # --- 3. CHECK FACIAL EXPRESSION ---
         # Only check if neither hand gesture/pose was detected
@@ -161,17 +188,20 @@ with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as 
                     upper_lip = face_landmarks.landmark[13]
                     lower_lip = face_landmarks.landmark[14]
 
-                    mouth_width = ((right_corner.x - left_corner.x)**2 + (right_corner.y - left_corner.y)**2)**0.5
-                    mouth_height = ((lower_lip.x - upper_lip.x)**2 + (lower_lip.y - upper_lip.y)**2)**0.5
-                    
-                    if mouth_width > 0:
-                        mouth_aspect_ratio = mouth_height / mouth_width
-                        if mouth_aspect_ratio > SMILE_THRESHOLD:
-                            current_state = "SMILING"
-                        elif mouth_aspect_ratio < SAD_THRESHOLD:
-                            current_state = "SAD"
-                        else:
-                            current_state = "STRAIGHT_FACE"
+                    # check if corners of lips are higher or lower than center of lips
+                    y_of_corners = (left_corner.y + right_corner.y) / 2
+                    y_of_centers = (lower_lip.y + upper_lip.y) / 2
+
+                    # positive -> corners are above lips
+                    # negative -> corners are under lips
+                    y_diff = y_of_centers - y_of_corners
+
+                    if y_diff > SMILE_THRESHOLD:
+                        current_state = "SMILING"
+                    elif y_diff < SAD_THRESHOLD:
+                        current_state = "SAD"
+                    else:
+                        current_state = "STRAIGHT_FACE"
         
         # --- 4. SELECT EMOJI BASED ON FINAL STATE ---
         if current_state == "SMILING":
@@ -195,20 +225,21 @@ with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as 
 
         camera_frame_resized = cv2.resize(frame, (WINDOW_WIDTH, WINDOW_HEIGHT))
         
-        cv2.putText(camera_frame_resized, f'STATE: {current_state} {emoji_name}', (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
-        cv2.putText(camera_frame_resized, 'Press "q" to quit', (10, WINDOW_HEIGHT - 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+        if textToggle > 0:
+            cv2.putText(camera_frame_resized, f'STATE: {current_state}', (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
+            cv2.putText(camera_frame_resized, 'Press "q" to quit', (10, WINDOW_HEIGHT - 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
 
         cv2.imshow('Camera Feed', camera_frame_resized)
         cv2.imshow('Emoji Output', emoji_to_display)
 
-        # Print mouth ratio if relevant (optional)
-        if current_state != "HANDS_UP" and current_state != "THUMBS_UP" and results_face and results_face.multi_face_landmarks:
-            print(f"Mouth ratio: {mouth_aspect_ratio:.3f}")
+        key = cv2.waitKey(5) & 0xFF
 
-        if cv2.waitKey(5) & 0xFF == ord('q'):
-            break
+        if key == ord('q'):
+            break # exit
+        elif key == ord('t'):
+            textToggle = textToggle * -1
 
 cap.release()
 cv2.destroyAllWindows()
