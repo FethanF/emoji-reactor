@@ -5,7 +5,10 @@ Real-time emoji display based on camera pose and facial expression detection.
 
 import cv2
 import mediapipe as mp
-import numpy as np
+# NEW IMPORTS FOR GESTURE RECOGNIZER
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+import numpy as np 
 
 # Initialize MediaPipe
 mp_pose = mp.solutions.pose
@@ -13,12 +16,31 @@ mp_face_mesh = mp.solutions.face_mesh
 mp_drawing = mp.solutions.drawing_utils
 
 # Configuration
-SMILE_THRESHOLD = 0.05
-SAD_THRESHOLD = 0.038
-FIST_THRESHOLD = 0.12
+SMILE_THRESHOLD = 0.07
+SAD_THRESHOLD = 0.035
 WINDOW_WIDTH = 720
 WINDOW_HEIGHT = 450
 EMOJI_WINDOW_SIZE = (WINDOW_WIDTH, WINDOW_HEIGHT)
+
+# --- NEW: GESTURE RECOGNIZER SETUP ---
+MODEL_PATH = 'gesture_recognizer.task'
+try:
+    # BaseOptions: Path to the model file
+    base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
+    
+    # GestureRecognizerOptions: Settings for the recognizer (using IMAGE mode for simplicity)
+    options = vision.GestureRecognizerOptions(base_options=base_options,
+                                               running_mode=vision.RunningMode.IMAGE,
+                                               num_hands=2) # Detect up to two hands
+
+    # Create the recognizer instance
+    recognizer = vision.GestureRecognizer.create_from_options(options)
+
+except Exception as e:
+    print(f"Error initializing Gesture Recognizer. Ensure '{MODEL_PATH}' is in the directory and MediaPipe is updated.")
+    print(f"Details: {e}")
+    exit()
+# -------------------------------------
 
 # Load emoji images
 try:
@@ -73,9 +95,11 @@ cv2.moveWindow('Emoji Output', WINDOW_WIDTH + 150, 100)
 print("Controls:")
 print("  Press 'q' to quit")
 print("  Raise hands above shoulders for hands up")
+print("  Perform 'thumbs up' for thumbs up emoji")
 print("  Smile for smiling emoji")
 print("  Straight face for neutral emoji")
 
+# mp_pose is kept running ONLY for the 'Hands Up' body pose check
 with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose, \
      mp_face_mesh.FaceMesh(max_num_faces=1, min_detection_confidence=0.5) as face_mesh:
 
@@ -86,66 +110,38 @@ with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as 
 
         frame = cv2.flip(frame, 1)
         image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
         image_rgb.flags.writeable = False
 
         current_state = "STRAIGHT_FACE"
+        mouth_aspect_ratio = 0.0 # Initialize for printing
 
-        # Check for thumbs up
-        left_thumb_up = False
-        right_thumb_up = False
-        results_pose = pose.process(image_rgb)
+        # --- 1. CHECK FOR THUMBS UP (USING NEW MODEL) ---
+        # Convert the frame to a MediaPipe Image object
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_rgb)
+        recognition_result = recognizer.recognize(mp_image)
 
-        if results_pose.pose_landmarks:
-            landmarks = results_pose.pose_landmarks.landmark
+        if recognition_result.gestures:
+            # The result contains a list of gestures, one list per hand
+            for gesture_list in recognition_result.gestures:
+                # Loop through all detected gestures (usually only one per hand)
+                for gesture in gesture_list:
+                    # Check for the standardized gesture name
+                    if gesture.category_name == "Thumb_Up":
+                        current_state = "THUMBS_UP"
+                        break
+                if current_state == "THUMBS_UP":
+                    break
+        # ------------------------------------------------
 
-            # Left Hand Landmarks
-            left_thumb = landmarks[mp_pose.PoseLandmark.LEFT_THUMB]
-            left_wrist = landmarks[mp_pose.PoseLandmark.LEFT_WRIST]
-            left_index = landmarks[mp_pose.PoseLandmark.LEFT_INDEX]
-            left_pinky = landmarks[mp_pose.PoseLandmark.LEFT_PINKY]
-
-            # Right Hand Landmarks
-            right_thumb = landmarks[mp_pose.PoseLandmark.RIGHT_THUMB]
-            right_wrist = landmarks[mp_pose.PoseLandmark.RIGHT_WRIST]
-            right_index = landmarks[mp_pose.PoseLandmark.RIGHT_INDEX]
-            right_pinky = landmarks[mp_pose.PoseLandmark.RIGHT_PINKY]
-
-            # --- Thumbs Up Check (Revised Logic: Thumb Up + Index AND Pinky Close to Wrist) ---
-
-            # Left Hand Distances (Euclidean distance between Index/Pinky tip and Wrist)
-            left_index_dist = np.sqrt(
-                (left_index.x - left_wrist.x)**2 + (left_index.y - left_wrist.y)**2
-            )
-            left_pinky_dist = np.sqrt(
-                (left_pinky.x - left_wrist.x)**2 + (left_pinky.y - left_wrist.y)**2
-            )
-            # Right Hand Distances
-            right_index_dist = np.sqrt(
-                (right_index.x - right_wrist.x)**2 + (right_index.y - right_wrist.y)**2
-            )
-            right_pinky_dist = np.sqrt(
-                (right_pinky.x - right_wrist.x)**2 + (right_pinky.y - right_wrist.y)**2
-            )
-
-            # Logic for Thumbs Up: Thumb is high AND Index/Pinky are close to the wrist (fist)
-            left_thumb_is_up = left_thumb.y < left_wrist.y - 0.05
-            left_is_fist = (left_index_dist < FIST_THRESHOLD) and (left_pinky_dist < FIST_THRESHOLD)
-            left_thumbs_up = left_thumb_is_up and left_is_fist
-
-            right_thumb_is_up = right_thumb.y < right_wrist.y - 0.05
-            right_is_fist = (right_index_dist < FIST_THRESHOLD) and (right_pinky_dist < FIST_THRESHOLD)
-            right_thumbs_up = right_thumb_is_up and right_is_fist
-
-            if left_thumb_up or right_thumb_up:
-                current_state = "THUMBS_UP"
-
-
-        # Check for hands up if thumbs not up
+        # --- 2. CHECK FOR HANDS UP (USING BODY POSE) ---
+        # Only check this if THUMBS_UP wasn't detected
         if current_state != "THUMBS_UP":
             results_pose = pose.process(image_rgb)
             if results_pose.pose_landmarks:
                 landmarks = results_pose.pose_landmarks.landmark
-                
+
+                # This logic checks if wrists are above shoulders
                 left_shoulder = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER]
                 right_shoulder = landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER]
                 left_wrist = landmarks[mp_pose.PoseLandmark.LEFT_WRIST]
@@ -154,7 +150,8 @@ with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as 
                 if (left_wrist.y < left_shoulder.y) or (right_wrist.y < right_shoulder.y):
                     current_state = "HANDS_UP"
         
-        # Check facial expression if hands not up
+        # --- 3. CHECK FACIAL EXPRESSION ---
+        # Only check if neither hand gesture/pose was detected
         if current_state != "HANDS_UP" and current_state != "THUMBS_UP":
             results_face = face_mesh.process(image_rgb)
             if results_face.multi_face_landmarks:
@@ -176,7 +173,7 @@ with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as 
                         else:
                             current_state = "STRAIGHT_FACE"
         
-        # Select emoji based on state
+        # --- 4. SELECT EMOJI BASED ON FINAL STATE ---
         if current_state == "SMILING":
             emoji_to_display = smiling_emoji
             emoji_name = "😊"
@@ -206,8 +203,9 @@ with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as 
         cv2.imshow('Camera Feed', camera_frame_resized)
         cv2.imshow('Emoji Output', emoji_to_display)
 
-        print(f"Mouth ratio: {mouth_aspect_ratio:.3f}")
-
+        # Print mouth ratio if relevant (optional)
+        if current_state != "HANDS_UP" and current_state != "THUMBS_UP" and results_face and results_face.multi_face_landmarks:
+            print(f"Mouth ratio: {mouth_aspect_ratio:.3f}")
 
         if cv2.waitKey(5) & 0xFF == ord('q'):
             break
